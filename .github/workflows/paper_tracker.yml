@@ -1,0 +1,36 @@
+name: Weekly Optical Paper Tracker
+
+on:
+  schedule:
+    # Cron 语法: 分 时 日 月 周
+    # UTC 时间 0:00 对应北京时间 08:00 (每周一执行)
+    - cron: '0 0 * * 1'
+  workflow_dispatch: # 支持在 GitHub 网页上手动点击按钮立即测试
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    steps:
+    - name: 检出仓库代码
+      uses: actions/checkout@v3
+
+    - name: 配置 Python 环境
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: 安装依赖包
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: 运行推送脚本
+      env:
+        AI_API_KEY: ${{ secrets.AI_API_KEY }}
+        AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+        SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+        SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+        RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+      run: python main.py
