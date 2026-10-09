@@ -363,6 +363,37 @@ def send_weekly_email(high_score_papers):
         raise
 
 # ================= 3. 执行入口 =================
+STATE_FILE = "tracker_state.json"
+
+
+def load_evaluated_dois():
+    if not os.path.exists(STATE_FILE):
+        return set()
+
+    # 状态损坏时直接报错，避免静默丢失记录后重复发邮件
+    with open(STATE_FILE, "r", encoding="utf-8") as file:
+        state = json.load(file)
+
+    values = state.get("evaluated_dois", [])
+    if not isinstance(values, list):
+        raise ValueError("去重状态格式不正确")
+
+    return set(values)
+
+
+def save_evaluated_dois(dois):
+    temporary_file = STATE_FILE + ".tmp"
+
+    with open(temporary_file, "w", encoding="utf-8") as file:
+        json.dump(
+            {"evaluated_dois": sorted(dois)},
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(temporary_file, STATE_FILE)
+    
 if __name__ == "__main__":
     now = datetime.now(timezone.utc)
     start_date = (now - timedelta(days=LOOKBACK_DAYS)).date().isoformat()
@@ -373,6 +404,8 @@ if __name__ == "__main__":
     failures = []
     incomplete_sources = []
     seen_this_run = set()
+    evaluated_dois = load_evaluated_dois()
+    newly_evaluated_dois = set()
     successful_sources = 0
 
     with create_http_session() as session:
@@ -393,7 +426,10 @@ if __name__ == "__main__":
             candidate_count = 0
 
             for paper in papers:
-                if paper["doi"] in seen_this_run:
+                if (
+                    paper["doi"] in seen_this_run
+                    or paper["doi"] in evaluated_dois
+                ):
                     continue
                 seen_this_run.add(paper["doi"])
 
@@ -429,6 +465,7 @@ if __name__ == "__main__":
                     raise RuntimeError("AI 分析失败，请检查配置或服务")
 
                 paper["ai_eval"] = ai_eval
+                newly_evaluated_dois.add(paper["doi"])
                 if score >= MIN_AI_SCORE:
                     matched_papers.append(paper)
 
@@ -463,6 +500,9 @@ if __name__ == "__main__":
         reverse=True,
     )
     send_weekly_email(matched_papers)
+    save_evaluated_dois(
+        evaluated_dois | newly_evaluated_dois
+    )
 
     # 即使其他来源取得结果，也明确标记本次覆盖不完整
     if failures or incomplete_sources:
