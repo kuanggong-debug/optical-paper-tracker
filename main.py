@@ -27,7 +27,7 @@ RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "")
 
 # 抓取最近 7 天（168 小时）文献，评分达到 6 分以上进入周报
 
-MIN_AI_SCORE = 6
+MIN_AI_SCORE = 0
 
 # 用期刊 ISSN 检索 Crossref，无需 Crossref API Key
 JOURNAL_ISSNS = {
