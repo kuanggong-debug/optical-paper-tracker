@@ -549,6 +549,22 @@ if __name__ == "__main__":
 
     # 即使其他来源取得结果，也明确标记本次覆盖不完整
     if failures or incomplete_sources or ai_failures:
-        raise RuntimeError(
-            "部分来源抓取或 AI 分析未完成，请检查报告和日志"
-        )
+        details = []
+
+        if failures:
+            details.append("抓取失败：" + "、".join(failures))
+
+        if incomplete_sources:
+            details.append(
+                "分页未完成：" + "、".join(incomplete_sources)
+            )
+
+        if ai_failures:
+            details.append(f"AI 分析失败：{len(ai_failures)} 篇")
+            for failure in ai_failures[:5]:
+                print(
+                    f"[AI失败详情] {failure['doi']} | "
+                    f"{failure['error_type']}"
+                )
+
+        raise RuntimeError("；".join(details))
