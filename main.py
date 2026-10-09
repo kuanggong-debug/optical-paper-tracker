@@ -16,9 +16,7 @@ from datetime import datetime, timedelta
 
 # ================= 1. 环境与参数配置 =================
 AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_BASE_URL = (
-    os.getenv("AI_BASE_URL") or "https://api.deepseek.com/v1"
-)
+AI_BASE_URL = (os.getenv("AI_BASE_URL") or "").strip()
 AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "deepseek-chat") or "deepseek-chat"
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com") or "smtp.qq.com"
@@ -455,6 +453,11 @@ def send_weekly_email(high_score_papers):
         raise
 
 # ================= 3. 执行入口 =================
+if not AI_API_KEY:
+    raise RuntimeError("请配置 AI_API_KEY Secret")
+
+if not AI_BASE_URL:
+    raise RuntimeError("请配置米醋平台的 AI_BASE_URL Secret")
 ai_failures = []
 STATE_FILE = "tracker_state.json"
 
