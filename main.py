@@ -16,20 +16,21 @@ from datetime import datetime, timedelta
 
 # ================= 1. 环境与参数配置 =================
 AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
-AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "deepseek-chat")
+AI_BASE_URL = (
+    os.getenv("AI_BASE_URL") or "https://api.deepseek.com/v1"
+)
+AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "deepseek-chat") or "deepseek-chat"
 
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com") or "smtp.qq.com"
+SMTP_PORT = int(os.getenv("SMTP_PORT") or "465")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD", "")
 RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "")
 
 # 抓取最近 7 天（168 小时）文献，评分达到 6 分以上进入周报
-TIME_WINDOW_HOURS = 168
+
 MIN_AI_SCORE = 6
 
-# 目标 7 大期刊的 RSS 订阅源
 # 用期刊 ISSN 检索 Crossref，无需 Crossref API Key
 JOURNAL_ISSNS = {
     "JLT (Lightwave Tech)": "0733-8724",
@@ -48,7 +49,7 @@ MAX_PAGES_PER_JOURNAL = 10
 PAGE_SIZE = 100
 
 # 可配置联系邮箱，供 Crossref 识别请求来源
-CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO", SENDER_EMAIL)
+CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO") or SENDER_EMAIL
 
 MPI_TERMS = [
     "multipath interference",
@@ -254,10 +255,9 @@ def fetch_crossref_papers(session, journal, issn, start_date, end_date):
             break
 
         next_cursor = message.get("next-cursor")
-        if not next_cursor or next_cursor == cursor:
-            print(f"[警告] {journal}: 游标未继续，结果可能不完整")
+        if not next_cursor:
+            print(f"[警告] {journal}: 缺少分页游标，结果可能不完整")
             break
-
         cursor = next_cursor
         time.sleep(1)
 
@@ -302,10 +302,37 @@ def analyze_paper_with_ai(paper):
             response_format={"type": "json_object"},
             temperature=0.1
         )
-        return json.loads(response.choices[0].message.content)
+        result = json.loads(
+            response.choices[0].message.content or ""
+        )
+
+        if not isinstance(result, dict):
+            raise ValueError("AI 返回结果不是 JSON 对象")
+
+        score = result.get("score")
+        if (
+            not isinstance(score, int)
+            or isinstance(score, bool)
+            or not 0 <= score <= 10
+        ):
+            raise ValueError("AI score 必须是 0–10 的整数")
+
+        for field in [
+            "relevance_reason",
+            "innovation",
+            "recommendation",
+        ]:
+            value = result.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"AI 缺少有效字段: {field}")
+
+        if result["recommendation"] not in {"精读", "扫读", "忽略"}:
+            raise ValueError("AI recommendation 无效")
+
+        return result
     except Exception as e:
-        print(f"AI 分析出现异常: {e}")
-        return {"score": 0, "relevance_reason": "解析失败", "innovation": "无", "recommendation": "忽略"}
+        print(f"AI 分析失败: {type(e).__name__}")
+        raise
 
 def send_weekly_email(high_score_papers):
     """发送 HTML 格式每周文献周报"""
@@ -313,8 +340,16 @@ def send_weekly_email(high_score_papers):
         print("本周无符合要求的高评分文献，跳过邮件发送。")
         return
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    subject = f"【文献周报】{today_str} 近一周光通信与 MPI 算法推荐 ({len(high_score_papers)}篇)"
+    from email.utils import formataddr
+    from zoneinfo import ZoneInfo
+    today_str = datetime.now(
+        ZoneInfo("Asia/Shanghai")
+    ).strftime("%Y-%m-%d")
+
+    subject = (
+        f"【文献周报】{today_str} "
+        f"光通信与 MPI 文献推荐 ({len(high_score_papers)}篇)"
+    )
     
     html_cards = ""
     for p in high_score_papers:
@@ -348,21 +383,29 @@ def send_weekly_email(high_score_papers):
     """
 
     msg = MIMEText(html_body, 'html', 'utf-8')
-    msg['From'] = Header("文献周报助手", 'utf-8')
-    msg['To'] = Header(RECEIVER_EMAIL, 'utf-8')
+    msg['From'] = formataddr(
+        ("文献周报助手", SENDER_EMAIL)
+    )
+    msg['To'] = RECEIVER_EMAIL
     msg['Subject'] = Header(subject, 'utf-8')
 
     try:
-        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
-        server.quit()
+        with smtplib.SMTP_SSL(
+            SMTP_SERVER, SMTP_PORT, timeout=30
+        ) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(
+                SENDER_EMAIL,
+                [RECEIVER_EMAIL],
+                msg.as_string(),
+            )
         print("周报邮件已顺利发送！")
     except Exception as e:
         print(f"邮件发送失败: {type(e).__name__}")
         raise
 
 # ================= 3. 执行入口 =================
+ai_failures = []
 STATE_FILE = "tracker_state.json"
 
 
@@ -450,21 +493,20 @@ if __name__ == "__main__":
                     print("[待核实] 缺少摘要，暂不进行 AI 评分")
                     continue
 
-                ai_eval = analyze_paper_with_ai(paper)
-                score = ai_eval.get("score")
+                try:
+                    ai_eval = analyze_paper_with_ai(paper)
+                except Exception as exc:
+                    ai_failures.append({
+                        "doi": paper["doi"],
+                        "title": paper["title"],
+                        "error_type": type(exc).__name__,
+                    })
+                    print(f"[AI失败] {paper['title']}")
+                    continue
 
-                if (
-                    not isinstance(score, int)
-                    or isinstance(score, bool)
-                    or not 0 <= score <= 10
-                ):
-                    raise ValueError("AI 返回了无效的 score")
-
-                if ai_eval.get("relevance_reason") == "解析失败":
-                    # 原函数把异常变成 0 分；这里让失败明确暴露
-                    raise RuntimeError("AI 分析失败，请检查配置或服务")
-
+                score = ai_eval["score"]
                 paper["ai_eval"] = ai_eval
+                
                 newly_evaluated_dois.add(paper["doi"])
                 if score >= MIN_AI_SCORE:
                     matched_papers.append(paper)
@@ -482,6 +524,7 @@ if __name__ == "__main__":
         "missing_abstract": missing_abstract,
         "failed_sources": failures,
         "incomplete_sources": incomplete_sources,
+        "ai_failures": ai_failures,
     }
     with open("reports/latest.json", "w", encoding="utf-8") as file:
         json.dump(report, file, ensure_ascii=False, indent=2)
@@ -505,5 +548,7 @@ if __name__ == "__main__":
     )
 
     # 即使其他来源取得结果，也明确标记本次覆盖不完整
-    if failures or incomplete_sources:
-        raise RuntimeError("部分来源失败或抓取不完整，请检查日志")
+    if failures or incomplete_sources or ai_failures:
+        raise RuntimeError(
+            "部分来源抓取或 AI 分析未完成，请检查报告和日志"
+        )
