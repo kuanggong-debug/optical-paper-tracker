@@ -35,7 +35,7 @@ RECEIVER_EMAIL = (os.getenv("RECEIVER_EMAIL") or "").strip()
 
 # 0 分门槛用于测试：所有成功评分的候选都进入邮件。
 # 正式运行可按需要改为 5 或 6。
-MIN_AI_SCORE = 0
+MIN_AI_SCORE = 5
 
 # 工作流中的 LOOKBACK_DAYS 优先于这里的默认值。
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS") or "14")
