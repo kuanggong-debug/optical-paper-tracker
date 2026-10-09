@@ -45,8 +45,8 @@ JOURNAL_ISSNS = {
 # 检索最近被索引或更新的记录，窗口重叠减少延迟收录造成的漏检。
 # 这不等同于“最近 14 天发表”，邮件中需要相应修改描述。
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "14"))
-MAX_PAGES_PER_JOURNAL = 10
-PAGE_SIZE = 100
+MAX_PAGES_PER_JOURNAL = 20
+PAGE_SIZE = 500
 
 # 可配置联系邮箱，供 Crossref 识别请求来源
 CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO") or SENDER_EMAIL
@@ -207,67 +207,117 @@ def get_publication_date(item):
     return "未知"
 
 
-def fetch_crossref_papers(session, journal, issn, start_date, end_date):
+def fetch_crossref_papers(
+    session, journal, issn, start_date, end_date
+):
     url = f"https://api.crossref.org/journals/{issn}/works"
-    cursor = "*"
     papers = {}
-    complete = False
+    all_complete = True
 
-    for page in range(MAX_PAGES_PER_JOURNAL):
-        params = {
-            "filter": (
-                f"from-index-date:{start_date},"
-                f"until-index-date:{end_date}"
-            ),
-            "rows": PAGE_SIZE,
-            "cursor": cursor,
-        }
-        if CROSSREF_MAILTO:
-            params["mailto"] = CROSSREF_MAILTO
+    # 分别检索新登记和新发表记录，再按 DOI 合并
+    date_windows = [
+        ("created", "新登记"),
+        ("pub", "新发表"),
+    ]
 
-        response = session.get(url, params=params, timeout=(10, 60))
-        response.raise_for_status()
-        message = response.json()["message"]
-        items = message.get("items", [])
+    for date_field, label in date_windows:
+        cursor = "*"
+        scanned = 0
+        complete = False
 
-        print(
-            f"[Crossref] {journal}: "
-            f"第 {page + 1} 页，返回 {len(items)} 条"
-        )
-
-        for item in items:
-            titles = item.get("title") or []
-            doi = str(item.get("DOI") or "").strip().lower()
-            if not titles or not doi:
-                continue
-
-            papers[doi] = {
-                "journal": journal,
-                "title": clean_text(titles[0]),
-                "abstract": clean_text(item.get("abstract", "")),
-                "doi": doi,
-                "link": "https://doi.org/" + doi,
-                "publication_date": get_publication_date(item),
+        for page in range(MAX_PAGES_PER_JOURNAL):
+            params = {
+                "filter": (
+                    f"from-{date_field}-date:{start_date},"
+                    f"until-{date_field}-date:{end_date}"
+                ),
+                "rows": PAGE_SIZE,
+                "cursor": cursor,
             }
+            if CROSSREF_MAILTO:
+                params["mailto"] = CROSSREF_MAILTO
 
-        if len(items) < PAGE_SIZE:
-            complete = True
-            break
+            response = session.get(
+                url,
+                params=params,
+                timeout=(10, 60),
+            )
+            response.raise_for_status()
 
-        next_cursor = message.get("next-cursor")
-        if not next_cursor:
-            print(f"[警告] {journal}: 缺少分页游标，结果可能不完整")
-            break
-        cursor = next_cursor
-        time.sleep(1)
+            message = response.json()["message"]
+            items = message.get("items", [])
+            total = message.get("total-results")
+            scanned += len(items)
 
-    if not complete:
-        print(
-            f"[警告] {journal}: 检索未确认完成，"
-            "请检查分页上限及日志"
-        )
+            print(
+                f"[Crossref] {journal} / {label}: "
+                f"第 {page + 1} 页，"
+                f"本页 {len(items)} 条，"
+                f"累计 {scanned} 条，"
+                f"查询总量 {total}"
+            )
 
-    return list(papers.values()), complete
+            for item in items:
+                titles = item.get("title") or []
+                doi = str(item.get("DOI") or "").strip().lower()
+
+                if not titles or not doi:
+                    continue
+
+                paper = {
+                    "journal": journal,
+                    "title": clean_text(titles[0]),
+                    "abstract": clean_text(
+                        item.get("abstract", "")
+                    ),
+                    "doi": doi,
+                    "link": "https://doi.org/" + doi,
+                    "publication_date": get_publication_date(item),
+                }
+
+                # 重复 DOI 优先保留带摘要的记录
+                existing = papers.get(doi)
+                if (
+                    existing is None
+                    or (
+                        not existing["abstract"]
+                        and paper["abstract"]
+                    )
+                ):
+                    papers[doi] = paper
+
+            # 返回不足一页，或已达到查询总量，视为完成。
+            # 达到总量的判断避免最后一页恰好满页时误报。
+            reached_total = (
+                isinstance(total, int)
+                and scanned >= total
+            )
+
+            if len(items) < PAGE_SIZE or reached_total:
+                complete = True
+                break
+
+            next_cursor = message.get("next-cursor")
+            if not next_cursor:
+                print(
+                    f"[警告] {journal} / {label}: "
+                    "缺少下一页游标"
+                )
+                break
+
+            # Crossref 游标字符串相同不代表分页结束
+            cursor = next_cursor
+            time.sleep(1)
+
+        if not complete:
+            all_complete = False
+            print(
+                f"[警告] {journal} / {label}: "
+                f"分页未完成，已扫描 {scanned} 条，"
+                f"查询总量 {total}"
+            )
+
+    return list(papers.values()), all_complete
 
 def analyze_paper_with_ai(paper):
     """调用大模型评估与打分"""
@@ -519,7 +569,7 @@ if __name__ == "__main__":
     os.makedirs("reports", exist_ok=True)
     report = {
         "generated_at": now.isoformat(),
-        "index_window": [start_date, end_date],
+        "registration_and_publication_window": [start_date, end_date],
         "recommended": matched_papers,
         "missing_abstract": missing_abstract,
         "failed_sources": failures,
