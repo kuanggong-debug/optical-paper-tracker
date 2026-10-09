@@ -6,11 +6,9 @@ on:
     - cron: '0 0 * * 1'
   workflow_dispatch:
 
-# 用于提交跨周去重记录
 permissions:
-  contents: write
+  contents: read
 
-# 避免同一分支的任务同时发送邮件和修改状态
 concurrency:
   group: optical-paper-tracker-${{ github.ref }}
   cancel-in-progress: false
@@ -37,7 +35,7 @@ jobs:
       - name: 运行论文追踪脚本
         env:
           PYTHONUNBUFFERED: '1'
-          LOOKBACK_DAYS: '50'
+          LOOKBACK_DAYS: '30'
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_MODEL_NAME: ${{ vars.AI_MODEL_NAME }}
@@ -56,23 +54,3 @@ jobs:
           path: reports/
           if-no-files-found: warn
           retention-days: 30
-
-      - name: 提交跨周去重记录
-        if: always()
-        shell: bash
-        run: |
-          if [ ! -f tracker_state.json ]; then
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -- tracker_state.json
-
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-
-          git commit -m "Update paper tracker state"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
