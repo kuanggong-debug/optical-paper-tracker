@@ -40,6 +40,8 @@ jobs:
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_MODEL_NAME: ${{ vars.AI_MODEL_NAME }}
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
