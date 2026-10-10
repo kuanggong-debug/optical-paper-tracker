@@ -577,7 +577,8 @@ class AbstractFetcher:
                 attempt["status"] = "parse_error"
                 attempt["error_type"] = type(exc).__name__
 
-        return "", None, attemptsattempt["status"] = "abstract_found"
+        return "", None, attempts
+        attempt["status"] = "abstract_found"
                     return abstract, "OpenAlex", attempts
 
                 attempt["status"] = "no_abstract"
