@@ -884,7 +884,23 @@ def main():
                         continue
                     seen_this_run.add(paper["doi"])
 
-                    # 先补摘要，再关键词初筛。
+                    # 先关键词初筛，未通过的论文不请求补摘要。
+                    hit, keywords = is_relevant_by_keywords(
+                        paper["title"],
+                        paper["abstract"],
+                        paper["journal"],
+                    )
+                    if not hit:
+                        continue
+
+                    candidate_count += 1
+                    paper["matched_keywords"] = keywords
+
+                    print(
+                        f"[候选] {paper['title']} | {keywords}"
+                    )
+
+                    # 只为通过初筛且缺摘要的候选补摘要。
                     paper["abstract_lookup_attempts"] = []
 
                     if not paper["abstract"].strip():
@@ -898,13 +914,11 @@ def main():
                             paper["abstract_source"] = source
                             print(
                                 f"[补摘要成功] {source} | "
-                                f"{paper['doi']} | "
                                 f"{paper['title']}"
                             )
                         else:
                             print(
-                                f"[补摘要未获得] {paper['doi']} | "
-                                f"{paper['title']}"
+                                f"[补摘要未获得] {paper['title']}"
                             )
 
                         supplementation_results.append({
@@ -915,16 +929,6 @@ def main():
                             "attempts": attempts,
                         })
 
-                    hit, keywords = is_relevant_by_keywords(
-                        paper["title"],
-                        paper["abstract"],
-                        paper["journal"],
-                    )
-                    if not hit:
-                        continue
-
-                    candidate_count += 1
-                    paper["matched_keywords"] = keywords
                     paper["abstract_missing"] = not bool(
                         paper["abstract"].strip()
                     )
@@ -932,10 +936,6 @@ def main():
                         "title_only"
                         if paper["abstract_missing"]
                         else "title_and_abstract"
-                    )
-
-                    print(
-                        f"[候选] {paper['title']} | {keywords}"
                     )
 
                     if paper["abstract_missing"]:
