@@ -12,6 +12,7 @@ from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from openai import OpenAI
@@ -25,6 +26,14 @@ AI_MODEL_NAME = (
     os.getenv("AI_MODEL_NAME") or ""
 ).strip() or "deepseek-chat"
 
+# 补摘要平台的密钥，不是米醋平台的密钥。
+SEMANTIC_SCHOLAR_API_KEY = (
+    os.getenv("SEMANTIC_SCHOLAR_API_KEY") or ""
+).strip()
+OPENALEX_API_KEY = (
+    os.getenv("OPENALEX_API_KEY") or ""
+).strip()
+
 SMTP_SERVER = (
     os.getenv("SMTP_SERVER") or ""
 ).strip() or "smtp.qq.com"
@@ -33,11 +42,10 @@ SENDER_EMAIL = (os.getenv("SENDER_EMAIL") or "").strip()
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD") or ""
 RECEIVER_EMAIL = (os.getenv("RECEIVER_EMAIL") or "").strip()
 
-# 0 分门槛用于测试：所有成功评分的候选都进入邮件。
-# 正式运行可按需要改为 5 或 6。
+# 成功评分且达到该分数的候选进入邮件。
 MIN_AI_SCORE = 5
 
-# 工作流中的 LOOKBACK_DAYS 优先于这里的默认值。
+# 工作流传入的 LOOKBACK_DAYS 优先于默认值。
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS") or "14")
 MAX_PAGES_PER_JOURNAL = 20
 PAGE_SIZE = 500
@@ -132,7 +140,7 @@ OPTICAL_JOURNALS = set(JOURNAL_ISSNS) - {"NC (Nature Comms)"}
 # ================= 2. 文本处理与初筛 =================
 
 class TextExtractor(HTMLParser):
-    """去掉摘要中的 HTML / JATS 标签，保留文本。"""
+    """去掉 HTML / JATS 标签，保留文本。"""
 
     def __init__(self):
         super().__init__()
@@ -156,6 +164,14 @@ def normalize_text(value):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def normalize_doi(value):
+    text = str(value or "").strip().lower()
+    text = re.sub(
+        r"^https?://(?:dx\.)?doi\.org/", "", text
+    )
+    return text.removeprefix("doi:").strip()
+
+
 def contains_term(text, term):
     term = normalize_text(term)
     return re.search(
@@ -165,7 +181,6 @@ def contains_term(text, term):
 
 
 def is_relevant_by_keywords(title, abstract, journal=""):
-    # 缺摘要时，使用标题进行关键词初筛。
     content = normalize_text(
         (title or "") + " " + (abstract or "")
     )
@@ -255,7 +270,7 @@ def get_publication_date(item):
         "published-online",
         "published-print",
     ]:
-        parts = item.get(field, {}).get("date-parts", [])
+        parts = (item.get(field) or {}).get("date-parts", [])
         if parts and parts[0]:
             return "-".join(
                 f"{int(n):02d}" for n in parts[0]
@@ -267,8 +282,6 @@ def fetch_crossref_papers(
     session, journal, issn, start_date, end_date
 ):
     url = f"https://api.crossref.org/journals/{issn}/works"
-
-    # 只合并本次抓取的重复 DOI，不使用历史记录。
     papers = {}
     all_complete = True
 
@@ -297,9 +310,7 @@ def fetch_crossref_papers(
                 params["mailto"] = CROSSREF_MAILTO
 
             response = session.get(
-                url,
-                params=params,
-                timeout=(10, 60),
+                url, params=params, timeout=(10, 60)
             )
             response.raise_for_status()
 
@@ -318,16 +329,21 @@ def fetch_crossref_papers(
 
             for item in items:
                 titles = item.get("title") or []
-                doi = str(item.get("DOI") or "").strip().lower()
+                doi = normalize_doi(item.get("DOI"))
 
                 if not titles or not doi:
                     continue
 
+                abstract = clean_text(
+                    item.get("abstract", "")
+                )
+
                 paper = {
                     "journal": journal,
                     "title": clean_text(titles[0]),
-                    "abstract": clean_text(
-                        item.get("abstract", "")
+                    "abstract": abstract,
+                    "abstract_source": (
+                        "Crossref" if abstract else None
                     ),
                     "doi": doi,
                     "link": "https://doi.org/" + doi,
@@ -377,7 +393,8 @@ def fetch_crossref_papers(
         for paper in papers.values()
     )
     print(
-        f"[摘要统计] {journal}: 共 {len(papers)} 篇，"
+        f"[Crossref摘要统计] {journal}: "
+        f"共 {len(papers)} 篇，"
         f"有摘要 {abstract_count} 篇，"
         f"无摘要 {len(papers) - abstract_count} 篇"
     )
@@ -385,11 +402,190 @@ def fetch_crossref_papers(
     return list(papers.values()), all_complete
 
 
-# ================= 4. AI 评分 =================
+# ================= 4. 补充摘要 =================
+
+class AbstractFetcher:
+    """按 DOI 补摘要，记录来源及失败原因。"""
+
+    def __init__(self):
+        # 独立会话，避免将某个平台的密钥发送给其他平台。
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "OpticalPaperTracker/1.0",
+            "Accept": "application/json",
+        })
+        self.disabled_sources = set()
+
+    def close(self):
+        self.session.close()
+
+    def _get_json(
+        self, source, url, attempts, params=None, headers=None
+    ):
+        if source in self.disabled_sources:
+            attempts.append({
+                "source": source,
+                "status": "skipped_for_this_run",
+            })
+            return None, None
+
+        attempt = {"source": source}
+        attempts.append(attempt)
+
+        try:
+            response = self.session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=(10, 20),
+            )
+            attempt["http_status"] = response.status_code
+
+            if response.status_code != 200:
+                attempt["status"] = "http_error"
+                print(
+                    f"[补摘要] {source}: "
+                    f"HTTP {response.status_code}"
+                )
+
+                # 认证失败或限流时，本次运行不再反复请求该来源。
+                if response.status_code in {401, 403, 429}:
+                    self.disabled_sources.add(source)
+                    print(
+                        f"[补摘要] {source}: "
+                        "本次运行暂停该来源，继续尝试其他来源"
+                    )
+
+                return None, attempt
+
+            data = response.json()
+            attempt["status"] = "response_received"
+            return data, attempt
+
+        except Exception as exc:
+            attempt["status"] = "request_error"
+            attempt["error_type"] = type(exc).__name__
+
+            # 不打印 URL 或完整异常，避免泄露查询参数中的密钥。
+            print(
+                f"[补摘要] {source}: {type(exc).__name__}"
+            )
+            return None, attempt
+
+        finally:
+            # 请求间留出间隔；平台实际配额仍以其规则为准。
+            time.sleep(1.1)
+
+    def fetch(self, doi):
+        attempts = []
+
+        # ---------- Semantic Scholar ----------
+        headers = {}
+        if SEMANTIC_SCHOLAR_API_KEY:
+            headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
+
+        data, attempt = self._get_json(
+            source="Semantic Scholar",
+            url=(
+                "https://api.semanticscholar.org/graph/v1/paper/"
+                + quote("DOI:" + doi, safe=":")
+            ),
+            params={"fields": "title,abstract,externalIds"},
+            headers=headers,
+            attempts=attempts,
+        )
+
+        if data is not None:
+            try:
+                returned_doi = normalize_doi(
+                    (data.get("externalIds") or {}).get("DOI")
+                )
+
+                if returned_doi and returned_doi != doi:
+                    attempt["status"] = "doi_mismatch"
+                else:
+                    abstract = clean_text(
+                        data.get("abstract", "")
+                    )
+                    if abstract:
+                        attempt["status"] = "abstract_found"
+                        return (
+                            abstract,
+                            "Semantic Scholar",
+                            attempts,
+                        )
+                    attempt["status"] = "no_abstract"
+
+            except Exception as exc:
+                attempt["status"] = "parse_error"
+                attempt["error_type"] = type(exc).__name__
+
+        # ---------- OpenAlex ----------
+        if not OPENALEX_API_KEY:
+            attempts.append({
+                "source": "OpenAlex",
+                "status": "skipped_no_api_key",
+            })
+            return "", None, attempts
+
+        data, attempt = self._get_json(
+            source="OpenAlex",
+            url="https://api.openalex.org/works",
+            params={
+                "filter": f"doi:https://doi.org/{doi}",
+                "per-page": 1,
+                "api_key": OPENALEX_API_KEY,
+            },
+            attempts=attempts,
+        )
+
+        if data is not None:
+            try:
+                works = data.get("results") or []
+                if not works:
+                    attempt["status"] = "paper_not_found"
+                    return "", None, attempts
+
+                work = works[0]
+                returned_doi = normalize_doi(work.get("doi"))
+
+                if returned_doi != doi:
+                    attempt["status"] = "doi_mismatch"
+                    return "", None, attempts
+
+                index = (
+                    work.get("abstract_inverted_index") or {}
+                )
+
+                # 将“单词 → 位置列表”还原成摘要文本。
+                positions = {}
+                for word, offsets in index.items():
+                    for offset in offsets:
+                        positions[int(offset)] = word
+
+                abstract = clean_text(
+                    " ".join(
+                        positions[position]
+                        for position in sorted(positions)
+                    )
+                )
+
+                if abstract:
+                    attempt["status"] = "abstract_found"
+                    return abstract, "OpenAlex", attempts
+
+                attempt["status"] = "no_abstract"
+
+            except Exception as exc:
+                attempt["status"] = "parse_error"
+                attempt["error_type"] = type(exc).__name__
+
+        return "", None, attempts
+
+
+# ================= 5. AI 评分 =================
 
 def analyze_paper_with_ai(paper):
-    """有摘要时综合评估；缺摘要时按标题评估相关性。"""
-
     abstract = (paper.get("abstract") or "").strip()
     has_abstract = bool(abstract)
 
@@ -428,16 +624,16 @@ MPI 专指光通信中的多径干扰/串扰，不是 Message Passing Interface�
      现有信息未提供其与 MPI 问题的明确联系；
 0–2：偏题，或现有信息不足以支持其与课题相关。
 
-5 分论文只能推荐“扫读”，并明确说明迁移到 MPI 的依据与限制。
+5 分论文只能推荐“扫读”，并说明迁移到 MPI 的依据与限制。
 不得因为出现 PAM4、均衡或神经网络就自动给予 5 分。
 
-缺少摘要时，必须仍然进行评分，并遵守：
-1. 仅依据标题判断相关性，期刊名称不能代替研究内容证据。
+缺少摘要时，仍然进行评分，并遵守：
+1. 仅依据标题判断，期刊名称不能代替研究内容证据。
 2. 标题明确涉及 MPI 时可以给予较高相关性评分。
-3. 标题信息不足时应保守评分，不得猜测摘要或正文。
-4. relevance_reason 必须以“仅依据标题：”开头，
-   并说明标题中的相关线索和判断限制。
-5. innovation 必须填写“缺少摘要，无法确认具体创新点”。
+3. 标题信息不足时保守评分，不得猜测摘要或正文。
+4. relevance_reason 以“仅依据标题：”开头，
+   说明相关线索和判断限制。
+5. innovation 填写“缺少摘要，无法确认具体创新点”。
 6. recommendation 只能选择“扫读”或“忽略”。
 
 严格输出 JSON，不包含 Markdown 标记或额外文字。
@@ -452,6 +648,7 @@ MPI 专指光通信中的多径干扰/串扰，不是 Message Passing Interface�
         f"期刊: {paper['journal']}\n"
         f"标题: {paper['title']}\n"
         f"可用评分依据: {basis_label}\n"
+        f"摘要来源: {paper.get('abstract_source') or '未获得'}\n"
         f"摘要: {abstract or '未提供摘要，请仅依据标题评估'}"
     )
 
@@ -496,7 +693,6 @@ MPI 专指光通信中的多径干扰/串扰，不是 Message Passing Interface�
         }:
             raise ValueError("AI recommendation 无效")
 
-        # 依据由程序确定，不由 AI 自行声明。
         result["evaluation_basis"] = evaluation_basis
 
         if not has_abstract:
@@ -507,7 +703,6 @@ MPI 专指光通信中的多径干扰/串扰，不是 Message Passing Interface�
                     "仅依据标题：" + result["relevance_reason"]
                 )
 
-            # 缺摘要时不展示模型推测的创新点。
             result["innovation"] = (
                 "缺少摘要，无法确认具体创新点"
             )
@@ -528,7 +723,7 @@ MPI 专指光通信中的多径干扰/串扰，不是 Message Passing Interface�
         client.close()
 
 
-# ================= 5. 邮件发送 =================
+# ================= 6. 邮件发送 =================
 
 def send_weekly_email(papers):
     if not papers:
@@ -540,7 +735,12 @@ def send_weekly_email(papers):
     ).strftime("%Y-%m-%d")
 
     title_only_count = sum(
-        not bool((paper.get("abstract") or "").strip())
+        paper["abstract_missing"] for paper in papers
+    )
+    supplemented_count = sum(
+        paper.get("abstract_source") in {
+            "Semantic Scholar", "OpenAlex"
+        }
         for paper in papers
     )
 
@@ -552,9 +752,7 @@ def send_weekly_email(papers):
     cards = []
     for paper in papers:
         ai = paper["ai_eval"]
-        abstract_text = (
-            paper.get("abstract") or ""
-        ).strip()
+        abstract_text = (paper.get("abstract") or "").strip()
 
         title = html.escape(paper["title"])
         journal = html.escape(paper["journal"])
@@ -567,7 +765,10 @@ def send_weekly_email(papers):
         )
 
         if abstract_text:
-            basis_label = "依据标题和摘要"
+            source = html.escape(
+                paper.get("abstract_source") or "未知"
+            )
+            basis_label = f"标题和摘要 · 摘要来源：{source}"
             basis_color = "#586069"
             abstract = html.escape(abstract_text)
 
@@ -580,11 +781,10 @@ def send_weekly_email(papers):
         else:
             basis_label = "仅依据标题，待核实"
             basis_color = "#856404"
-
             abstract_section = f"""
             <p style="font-size:13px;color:#856404;">
-                该数据源未提供摘要。本次仅按标题评估相关性，
-                请通过
+                本次未能从查询的数据源取得摘要。
+                已仅按标题评分，请通过
                 <a href="{link}">论文链接</a>
                 查看摘要或全文后确认。
             </p>
@@ -624,14 +824,12 @@ def send_weekly_email(papers):
             <h2>光通信与 MPI 文献周报</h2>
             <p>
                 本次检索最近 {LOOKBACK_DAYS} 天内新登记或发表的记录，
-                初筛并评分后收录以下候选。
-                当前收录门槛为 {MIN_AI_SCORE} 分，
-                请结合评分及分析依据选择阅读。
+                初筛、补摘要并评分后收录以下候选。
+                当前收录门槛为 {MIN_AI_SCORE} 分。
             </p>
-            <p style="font-size:13px;color:#856404;">
-                其中 {title_only_count} 篇缺少摘要，
-                已按标题评分并标记为待核实。
-                相关性评分不代表论文质量或算法效果。
+            <p style="font-size:13px;color:#586069;">
+                入选论文中，{supplemented_count} 篇获得了补充摘要；
+                {title_only_count} 篇仍缺摘要，按标题评分并标为待核实。
             </p>
             {''.join(cards)}
             <footer style="color:#959da5;font-size:12px;">
@@ -667,18 +865,15 @@ def send_weekly_email(papers):
         raise
 
 
-# ================= 6. 执行入口 =================
+# ================= 7. 执行入口 =================
 
 def main():
     if not AI_API_KEY:
         raise RuntimeError("请配置 AI_API_KEY Secret")
-
     if not AI_BASE_URL:
         raise RuntimeError("请配置米醋平台的 AI_BASE_URL Secret")
-
     if LOOKBACK_DAYS <= 0:
         raise ValueError("LOOKBACK_DAYS 必须大于 0")
-
     if not 0 <= MIN_AI_SCORE <= 10:
         raise ValueError("MIN_AI_SCORE 必须在 0–10 之间")
 
@@ -693,6 +888,13 @@ def main():
         f"AI 模型：{AI_MODEL_NAME}，"
         f"收录门槛：{MIN_AI_SCORE} 分"
     )
+    print(
+        "[补摘要配置] "
+        f"Semantic Scholar 密钥："
+        f"{'已配置' if SEMANTIC_SCHOLAR_API_KEY else '未配置，尝试公共访问'}；"
+        f"OpenAlex 密钥："
+        f"{'已配置' if OPENALEX_API_KEY else '未配置，跳过该来源'}"
+    )
 
     matched_papers = []
     missing_abstract = []
@@ -700,113 +902,140 @@ def main():
     incomplete_sources = []
     ai_failures = []
     evaluated_papers = []
+    supplementation_results = []
     successful_sources = 0
-
-    # 每次运行重新创建，不读取跨周历史记录。
     seen_this_run = set()
 
-    with create_http_session() as session:
-        for journal, issn in JOURNAL_ISSNS.items():
-            try:
-                papers, complete = fetch_crossref_papers(
-                    session,
-                    journal,
-                    issn,
-                    start_date,
-                    end_date,
-                )
+    fetcher = AbstractFetcher()
 
-                successful_sources += 1
-                if not complete:
-                    incomplete_sources.append(journal)
-
-            except Exception as exc:
-                failures.append(journal)
-                print(
-                    f"[抓取失败] {journal}: "
-                    f"{type(exc).__name__}"
-                )
-                continue
-
-            candidate_count = 0
-
-            for paper in papers:
-                # 仅避免同一次运行重复处理相同 DOI。
-                if paper["doi"] in seen_this_run:
-                    continue
-                seen_this_run.add(paper["doi"])
-
-                hit, keywords = is_relevant_by_keywords(
-                    paper["title"],
-                    paper["abstract"],
-                    paper["journal"],
-                )
-                if not hit:
-                    continue
-
-                candidate_count += 1
-                paper["matched_keywords"] = keywords
-                paper["abstract_missing"] = not bool(
-                    paper["abstract"].strip()
-                )
-                paper["evaluation_basis"] = (
-                    "title_only"
-                    if paper["abstract_missing"]
-                    else "title_and_abstract"
-                )
-
-                print(
-                    f"[候选] {paper['title']} | {keywords}"
-                )
-
-                if paper["abstract_missing"]:
-                    missing_abstract.append(paper)
-                    print(
-                        "[标题评分] 缺少摘要，"
-                        "仅依据标题进行 AI 评估"
-                    )
-
-                # 有无摘要都进入 AI 评分。
+    try:
+        with create_http_session() as session:
+            for journal, issn in JOURNAL_ISSNS.items():
                 try:
-                    ai_eval = analyze_paper_with_ai(paper)
+                    papers, complete = fetch_crossref_papers(
+                        session, journal, issn,
+                        start_date, end_date,
+                    )
+                    successful_sources += 1
+                    if not complete:
+                        incomplete_sources.append(journal)
 
                 except Exception as exc:
-                    ai_failures.append({
-                        "doi": paper["doi"],
-                        "title": paper["title"],
-                        "evaluation_basis": (
-                            paper["evaluation_basis"]
-                        ),
-                        "error_type": type(exc).__name__,
-                    })
-                    print(f"[AI失败] {paper['title']}")
+                    failures.append(journal)
+                    print(
+                        f"[抓取失败] {journal}: "
+                        f"{type(exc).__name__}"
+                    )
                     continue
 
-                paper["ai_eval"] = ai_eval
-                evaluated_papers.append(paper)
-                score = ai_eval["score"]
+                candidate_count = 0
 
-                basis_label = (
-                    "仅依据标题"
-                    if paper["abstract_missing"]
-                    else "标题和摘要"
-                )
+                for paper in papers:
+                    if paper["doi"] in seen_this_run:
+                        continue
+                    seen_this_run.add(paper["doi"])
+
+                    # 先初筛，再为候选补摘要。
+                    hit, keywords = is_relevant_by_keywords(
+                        paper["title"],
+                        paper["abstract"],
+                        paper["journal"],
+                    )
+                    if not hit:
+                        continue
+
+                    candidate_count += 1
+                    paper["matched_keywords"] = keywords
+                    paper["abstract_lookup_attempts"] = []
+
+                    print(
+                        f"[候选] {paper['title']} | {keywords}"
+                    )
+
+                    if not paper["abstract"].strip():
+                        abstract, source, attempts = fetcher.fetch(
+                            paper["doi"]
+                        )
+                        paper["abstract_lookup_attempts"] = attempts
+
+                        if abstract:
+                            paper["abstract"] = abstract
+                            paper["abstract_source"] = source
+                            print(
+                                f"[补摘要成功] {source} | "
+                                f"{paper['title']}"
+                            )
+                        else:
+                            print(
+                                f"[补摘要未获得] {paper['title']}"
+                            )
+
+                        supplementation_results.append({
+                            "doi": paper["doi"],
+                            "title": paper["title"],
+                            "success": bool(abstract),
+                            "source": source,
+                            "attempts": attempts,
+                        })
+
+                    # 补摘要完成后再决定评分依据。
+                    paper["abstract_missing"] = not bool(
+                        paper["abstract"].strip()
+                    )
+                    paper["evaluation_basis"] = (
+                        "title_only"
+                        if paper["abstract_missing"]
+                        else "title_and_abstract"
+                    )
+
+                    if paper["abstract_missing"]:
+                        missing_abstract.append(paper)
+                        print(
+                            "[标题评分] 仍缺少摘要，"
+                            "仅依据标题进行 AI 评估"
+                        )
+
+                    try:
+                        ai_eval = analyze_paper_with_ai(paper)
+                    except Exception as exc:
+                        ai_failures.append({
+                            "doi": paper["doi"],
+                            "title": paper["title"],
+                            "evaluation_basis": (
+                                paper["evaluation_basis"]
+                            ),
+                            "error_type": type(exc).__name__,
+                        })
+                        print(f"[AI失败] {paper['title']}")
+                        time.sleep(0.5)
+                        continue
+
+                    paper["ai_eval"] = ai_eval
+                    evaluated_papers.append(paper)
+                    score = ai_eval["score"]
+
+                    basis_label = (
+                        "仅依据标题"
+                        if paper["abstract_missing"]
+                        else "标题和摘要"
+                    )
+                    print(
+                        f"[AI评分/{basis_label}] {score}分 | "
+                        f"{paper['title']} | "
+                        f"{ai_eval['relevance_reason']}"
+                    )
+
+                    if score >= MIN_AI_SCORE:
+                        matched_papers.append(paper)
+
+                    time.sleep(0.5)
 
                 print(
-                    f"[AI评分/{basis_label}] "
-                    f"{score}分 | {paper['title']} | "
-                    f"{ai_eval['relevance_reason']}"
+                    f"[初筛] {journal}: "
+                    f"{candidate_count} 篇候选"
                 )
-
-                # 缺摘要论文使用同样的分数门槛。
-                if score >= MIN_AI_SCORE:
-                    matched_papers.append(paper)
-
-                time.sleep(0.5)
-
-            print(
-                f"[初筛] {journal}: {candidate_count} 篇候选"
-            )
+    finally:
+        fetcher.close()
 
     matched_papers.sort(
         key=lambda paper: paper["ai_eval"]["score"],
@@ -821,8 +1050,11 @@ def main():
         paper["abstract_missing"]
         for paper in matched_papers
     )
+    supplemented_count = sum(
+        result["success"]
+        for result in supplementation_results
+    )
 
-    # 报告用于查看结果，不用于跨周去重。
     os.makedirs("reports", exist_ok=True)
     report = {
         "generated_at": now.isoformat(),
@@ -831,7 +1063,11 @@ def main():
         ],
         "lookback_days": LOOKBACK_DAYS,
         "min_ai_score": MIN_AI_SCORE,
-        "missing_abstract_policy": "evaluate_title_only",
+        "missing_abstract_policy": (
+            "supplement_then_evaluate_title_only"
+        ),
+        "supplemented_abstract_count": supplemented_count,
+        "supplementation_results": supplementation_results,
         "title_only_evaluated_count": (
             title_only_evaluated_count
         ),
@@ -854,7 +1090,8 @@ def main():
         )
 
     print(
-        f"完成：评分成功 {len(evaluated_papers)} 篇，"
+        f"完成：补摘要成功 {supplemented_count} 篇；"
+        f"评分成功 {len(evaluated_papers)} 篇，"
         f"其中标题评分 {title_only_evaluated_count} 篇；"
         f"达到门槛 {len(matched_papers)} 篇，"
         f"其中缺摘要入选 {title_only_selected_count} 篇；"
@@ -869,6 +1106,8 @@ def main():
 
     send_weekly_email(matched_papers)
 
+    # 补摘要失败时已有标题评分兜底，不因此让任务失败。
+    # 抓取、分页或 AI 评分失败仍明确报告。
     if failures or incomplete_sources or ai_failures:
         details = []
 
@@ -876,12 +1115,10 @@ def main():
             details.append(
                 "抓取失败：" + "、".join(failures)
             )
-
         if incomplete_sources:
             details.append(
                 "分页未完成：" + "、".join(incomplete_sources)
             )
-
         if ai_failures:
             details.append(
                 f"AI 分析失败：{len(ai_failures)} 篇"
