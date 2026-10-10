@@ -521,43 +521,40 @@ class AbstractFetcher:
                 attempt["error_type"] = type(exc).__name__
 
         # ---------- OpenAlex ----------
-        if not OPENALEX_API_KEY:
-            attempts.append({
-                "source": "OpenAlex",
-                "status": "skipped_no_api_key",
-            })
-            return "", None, attempts
+        # OpenAlex 可使用 API Key，也可以尝试公共访问。
+        openalex_id = quote(
+            f"https://doi.org/{doi}",
+            safe=":/",
+        )
+
+        openalex_params = {}
+        if OPENALEX_API_KEY:
+            openalex_params["api_key"] = OPENALEX_API_KEY
 
         data, attempt = self._get_json(
             source="OpenAlex",
-            url="https://api.openalex.org/works",
-            params={
-                "filter": f"doi:https://doi.org/{doi}",
-                "per-page": 1,
-                "api_key": OPENALEX_API_KEY,
-            },
+            url=(
+                "https://api.openalex.org/works/"
+                + openalex_id
+            ),
+            params=openalex_params,
             attempts=attempts,
         )
 
         if data is not None:
             try:
-                works = data.get("results") or []
-                if not works:
-                    attempt["status"] = "paper_not_found"
-                    return "", None, attempts
+                returned_doi = normalize_doi(
+                    data.get("doi")
+                )
 
-                work = works[0]
-                returned_doi = normalize_doi(work.get("doi"))
-
-                if returned_doi != doi:
+                if returned_doi and returned_doi != doi:
                     attempt["status"] = "doi_mismatch"
                     return "", None, attempts
 
                 index = (
-                    work.get("abstract_inverted_index") or {}
+                    data.get("abstract_inverted_index") or {}
                 )
 
-                # 将“单词 → 位置列表”还原成摘要文本。
                 positions = {}
                 for word, offsets in index.items():
                     for offset in offsets:
@@ -572,6 +569,15 @@ class AbstractFetcher:
 
                 if abstract:
                     attempt["status"] = "abstract_found"
+                    return abstract, "OpenAlex", attempts
+
+                attempt["status"] = "no_abstract"
+
+            except Exception as exc:
+                attempt["status"] = "parse_error"
+                attempt["error_type"] = type(exc).__name__
+
+        return "", None, attemptsattempt["status"] = "abstract_found"
                     return abstract, "OpenAlex", attempts
 
                 attempt["status"] = "no_abstract"
@@ -935,48 +941,51 @@ def main():
                         continue
                     seen_this_run.add(paper["doi"])
 
-                    # 先初筛，再为候选补摘要。
-                    hit, keywords = is_relevant_by_keywords(
-                        paper["title"],
-                        paper["abstract"],
-                        paper["journal"],
+                # 先尝试补齐 Crossref 缺失的摘要，
+                # 再使用完整的标题和摘要进行关键词初筛。
+                paper["abstract_lookup_attempts"] = []
+
+                if not paper["abstract"].strip():
+                    abstract, source, attempts = fetcher.fetch(
+                        paper["doi"]
                     )
-                    if not hit:
-                        continue
+                    paper["abstract_lookup_attempts"] = attempts
 
-                    candidate_count += 1
-                    paper["matched_keywords"] = keywords
-                    paper["abstract_lookup_attempts"] = []
-
-                    print(
-                        f"[候选] {paper['title']} | {keywords}"
-                    )
-
-                    if not paper["abstract"].strip():
-                        abstract, source, attempts = fetcher.fetch(
-                            paper["doi"]
+                    if abstract:
+                        paper["abstract"] = abstract
+                        paper["abstract_source"] = source
+                        print(
+                            f"[补摘要成功] {source} | "
+                            f"{paper['title']}"
                         )
-                        paper["abstract_lookup_attempts"] = attempts
+                    else:
+                        print(
+                            f"[补摘要未获得] {paper['title']}"
+                        )
 
-                        if abstract:
-                            paper["abstract"] = abstract
-                            paper["abstract_source"] = source
-                            print(
-                                f"[补摘要成功] {source} | "
-                                f"{paper['title']}"
-                            )
-                        else:
-                            print(
-                                f"[补摘要未获得] {paper['title']}"
-                            )
+                    supplementation_results.append({
+                        "doi": paper["doi"],
+                        "title": paper["title"],
+                        "success": bool(abstract),
+                        "source": source,
+                        "attempts": attempts,
+                    })
 
-                        supplementation_results.append({
-                            "doi": paper["doi"],
-                            "title": paper["title"],
-                            "success": bool(abstract),
-                            "source": source,
-                            "attempts": attempts,
-                        })
+                # 补摘要后再进行关键词初筛。
+                hit, keywords = is_relevant_by_keywords(
+                    paper["title"],
+                    paper["abstract"],
+                    paper["journal"],
+                )
+                if not hit:
+                    continue
+
+                candidate_count += 1
+                paper["matched_keywords"] = keywords
+
+                print(
+                    f"[候选] {paper['title']} | {keywords}"
+                )
 
                     # 补摘要完成后再决定评分依据。
                     paper["abstract_missing"] = not bool(
